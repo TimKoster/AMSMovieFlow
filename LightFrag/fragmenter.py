@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import math
 import pandas as pd
+import tcmu
 
 # The fragmenter has 3 parts:
 # 1. Create bash files
@@ -43,19 +44,15 @@ class Results(object):
     fragment_1_energy:float = 0
     fragment_2_energy:float = 0
 
-    def __init__(self, Pauli, dispersion, elstat, orbital, interaction, fragment_1_energy, fragment_2_energy):
-        self.Pauli = float(Pauli)
-        self.dispersion = float(dispersion)
-        self.elstat = float(elstat)
-        self.orbital = float(orbital)
-        self.interaction = float(interaction)
-
-        self.fragment_1_energy = float(fragment_1_energy)
-        self.fragment_2_energy = float(fragment_2_energy)
+    # only dumb scrape
+    bonding_energ:float = 0
 
 # Read the fragment mapping, which can be 1,2,3-10, 17-20, 37 and convert it to a list of integers
-def read_fragment_mapping(fragment_mapping_string):
+def read_fragment_mapping(fragment_mapping_string:str|None) -> list[int]:
     fragment_mapping = list()
+
+    if fragment_mapping_string is None:
+        return fragment_mapping
 
     for string in fragment_mapping_string.split(","):
         if "-" in string:
@@ -94,17 +91,20 @@ class Configuration(object):
     bond_length:float = 0
     # Don't run any scripts, just gather the config and existing results and regenerate the results
     only_regenerate_results = False
+    # Only grab the formation energies from fragment_full
+    dumb_scrape = False
 
-    def __init__(self, IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results):
+    def __init__(self, IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape):
         self.IRC_path = IRC_path
         self.fragment_mapping = fragment_mapping
-        self.strain_fragment_1 = float(strain_fragment_1)
-        self.strain_fragment_2 = float(strain_fragment_2)
+        self.strain_fragment_1 = float(strain_fragment_1) if strain_fragment_1 is not None else 0.0
+        self.strain_fragment_2 = float(strain_fragment_2) if strain_fragment_2 is not None else 0.0
         # These indexes are 1 based, and python is 0 based, so just take care of it here
         self.bond_length_atom_1 = int(bond_length_atom_1) - 1
         self.bond_length_atom_2 = int(bond_length_atom_2) - 1
         self.bond_length = float(bond_length)
         self.only_regenerate_results = only_regenerate_results if only_regenerate_results is not None else False
+        self.dumb_scrape = dumb_scrape if dumb_scrape is not None else False
 
 # Read the the configuration header from the input file and put it in an object for easy access
 def read_configuration(data, calculation_folder):
@@ -121,15 +121,16 @@ def read_configuration(data, calculation_folder):
     strain_fragment_2 = read_parameter(config_list, "strain_fragment_2", 1)
 
     only_regenerate_results_value = read_parameter(config_list, "only_regenerate_results", 1)
-    only_regenerate_results = None
-    if only_regenerate_results_value is not None:
-        only_regenerate_results = True if only_regenerate_results_value.lower() == "true" else False
+    only_regenerate_results = True if only_regenerate_results_value and only_regenerate_results_value.lower() == "true" else False
+
+    dumb_scrape_value = read_parameter(config_list, "dumb_scrape", 1)
+    dumb_scrape = True if dumb_scrape_value and dumb_scrape_value.lower() == "true" else False
 
     bond_length_atom_1, bond_length_atom_2, bond_length = read_parameter(config_list, "bond_length", 3)
 
     fragment_mapping = FragmentMapping(fragment_mapping_1, fragment_mapping_2)
 
-    return Configuration(calculation_folder + "/" + IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results)
+    return Configuration(calculation_folder + "/" + IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape)
 
 # Read a parameter from the config
 def read_parameter(config_list, parameter_name, parameter_count) -> str|None:
@@ -165,20 +166,25 @@ def get_xyz_list(IRC_path):
         lattice_vectors = {}
         atom_coordinates = []
 
+
         for line in data_list[frame_index:]:
-            arguments = line.split(" ")
-            # Empty line, we hit. Go to next frame, we must
-            # TODO: so if there's no empty line at the end of the file we just ignore it ughh
-            if len(arguments) < 2:
-                xyz_list.append(LatticeXyz(atom_coordinates, lattice_vectors))
-                break
-            # Vector definition
-            elif "VEC" in arguments[0]:
-                # VEC1 2.0 1.0 0.0
-                lattice_vectors[arguments[0]] = [float(arguments[1]), float(arguments[2]), float(arguments[3])]
-            elif len(arguments) == 4:
-                # C 1.0 2.0 1.0
-                atom_coordinates.append([arguments[0], float(arguments[1]), float(arguments[2]), float(arguments[3])])
+            arguments = line.split()
+
+            # check if the line isnt empty 
+            if len(arguments) > 1:
+                if "VEC" in arguments[0]:
+                    # VEC1 2.0 1.0 0.0
+                    print(arguments)
+                    lattice_vectors[arguments[0]] = [float(arguments[1]), float(arguments[2]), float(arguments[3])]
+                elif len(arguments) == 4:
+                    # C 1.0 2.0 1.0
+                    atom_coordinates.append([arguments[0], float(arguments[1]), float(arguments[2]), float(arguments[3])])
+                # We're not the last line, so continue to the next loop
+                if line != data_list[-1]:
+                    continue
+            
+            xyz_list.append(LatticeXyz(atom_coordinates, lattice_vectors))
+            break
 
     return xyz_list
 
@@ -191,12 +197,16 @@ def scrape_template_script(data: str):
     return bin_bash + splice
 
 # Generate the fragments atoms from the mapping
-def generate_atoms_from_mapping(fragment_mapping_1: list[int], xyz: LatticeXyz):
+def generate_atoms_from_mapping(fragment_mapping: list[int]|None, xyz: LatticeXyz):
     mapped_atoms_string = ""
     # this makes ams happy 
     decimals = 8
 
-    for num in fragment_mapping_1:
+    # the whole thing
+    if fragment_mapping == None:
+        fragment_mapping = range(1, len(xyz.atoms) + 1)
+
+    for num in fragment_mapping:
         num -= 1 # The mapping is 1 indexed, but our list is 0 indexed
         mapped_atoms_string += f"{xyz.atoms[num][0]} {round(xyz.atoms[num][1], decimals)} {round(xyz.atoms[num][2], decimals)} {round(xyz.atoms[num][3], decimals)}\n"
     
@@ -227,7 +237,7 @@ def build_bash_scripts(data, configuration: Configuration, xyz_list: list[Lattic
         bash_script = template_script
 
         # Lattices
-        if xyz_list[i].lattice_vectors is not None:
+        if len(xyz_list[i].lattice_vectors) > 0:
             lattices = (
             f"{str(xyz_list[i].lattice_vectors['VEC1'][0])} {xyz_list[i].lattice_vectors['VEC1'][1]} {xyz_list[i].lattice_vectors['VEC1'][2]}\n"
             f"{str(xyz_list[i].lattice_vectors['VEC2'][0])} {xyz_list[i].lattice_vectors['VEC2'][1]} {xyz_list[i].lattice_vectors['VEC2'][2]}"
@@ -239,15 +249,17 @@ def build_bash_scripts(data, configuration: Configuration, xyz_list: list[Lattic
             bash_script = bash_script.replace("FRAGMENT_FULL_LATTICE", lattices)
 
         # Fragment_1_xyz
-        atom_mapping_fragment_1 = generate_atoms_from_mapping(configuration.fragment_mapping.fragment_mapping_1, xyz_list[i])
-        bash_script = bash_script.replace("FRAGMENT_1_XYZ", atom_mapping_fragment_1)
+        if configuration.fragment_mapping.fragment_mapping_1:
+            atom_mapping_fragment_1 = generate_atoms_from_mapping(configuration.fragment_mapping.fragment_mapping_1, xyz_list[i])
+            bash_script = bash_script.replace("FRAGMENT_1_XYZ", atom_mapping_fragment_1)
 
-        # Fragment_2_xyz
-        atom_mapping_fragment_2 = generate_atoms_from_mapping(configuration.fragment_mapping.fragment_mapping_2, xyz_list[i])
-        bash_script = bash_script.replace("FRAGMENT_2_XYZ", atom_mapping_fragment_2)
+        if configuration.fragment_mapping.fragment_mapping_2:
+            # Fragment_2_xyz
+            atom_mapping_fragment_2 = generate_atoms_from_mapping(configuration.fragment_mapping.fragment_mapping_2, xyz_list[i])
+            bash_script = bash_script.replace("FRAGMENT_2_XYZ", atom_mapping_fragment_2)
 
         # Fragment_full_xyz
-        atom_mapping_full = generate_atoms_from_mapping(configuration.fragment_mapping.fragment_mapping_1 + configuration.fragment_mapping.fragment_mapping_2, xyz_list[i])
+        atom_mapping_full = generate_atoms_from_mapping(None, xyz_list[i])
         bash_script = bash_script.replace("FRAGMENT_FULL_XYZ", atom_mapping_full)
 
         # Atoms mapping
@@ -328,20 +340,42 @@ def scrape_results(frame_folders: list[str]) -> list[Results]:
                     if len(subtext) > 0:
                         m2 = re.search(r"([-+]?[0-9]*\.?[0-9]+)\s*KCAL/MOL", subtext, flags=re.IGNORECASE)
                         fragment_energies.append(float(m2.group(1)))
-            print("energies", energies)
-            result:Results = Results(energies["E_Pauli"], 
-                                    energies["E_disp"], 
-                                    energies["E_elstat"], 
-                                    energies["E_orb"], 
-                                    energies["E_int"], 
-                                    round(fragment_energies[0] - configuration.strain_fragment_1, 4), 
-                                    round(fragment_energies[1] - configuration.strain_fragment_2, 4),
-                                )
+            print("Energies", energies)
+
+            if len(energies) == 0:
+                print(f"Could not read energies from {path}{file_full.name}")
+                continue
+
+            result:Results = Results()
+
+            result.Pauli = energies["E_Pauli"]
+            result.elstat = energies["E_elstat"]
+            result.dispersion = energies["E_disp"]
+            result.orbital = energies["E_orb"]
+            result.interaction = energies["E_int"]
+            result.fragment_1_energy = round(fragment_energies[0] - configuration.strain_fragment_1, 4)
+            result.fragment_2_energy = round(fragment_energies[1] - configuration.strain_fragment_2, 4)
+
             results.append(result)
 
     return results
 
-def print_results(results: list[Results], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str):
+def dumb_scrape_results(frame_folders: list[str]) -> list[float]:
+    dumb_results = list()
+
+    for folder in frame_folders:
+        with open(f"{folder}/fragment_full.log", 'r') as file_fragment:
+            match = re.search(r"Bond Energy\s+([-+]?\d+(?:\.\d+)?)\s+kcal/mol", file_fragment.read())
+            dumb_result = Results()
+
+            if match:
+                dumb_result.bond_energy = float(match.group(1))
+
+            dumb_results.append(dumb_result)
+
+    return dumb_results
+
+def print_results(results: list[Results]|list[float], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str):
     distances = list()
     for result in results:
         index = results.index(result)
@@ -383,31 +417,43 @@ def write_to_notebook(results: list[Results], configuration:Configuration, xyz_l
 def write_to_output(results: list[Results], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str, distances):
     info = list()
 
-    for result in results:
-        info.append([
-            results.index(result),
-            distances[results.index(result)],
-            result.fragment_1_energy,
-            result.fragment_2_energy,
-            result.Pauli,
-            result.dispersion,
-            result.elstat,
-            result.orbital,
-            result.interaction,
-        ])
+    if(configuration.dumb_scrape):
+        for result in results:
+            info.append([
+                results.index(result),
+                distances[results.index(result)],
+                result.bond_energy,
+            ])
+        table = pd.DataFrame(info, columns = [
+            "FRAME", 
+            "DISTANCE",
+            "BOND_ENERGY",
+            ])
+    else:
+        for result in results:
+            info.append([
+                results.index(result),
+                distances[results.index(result)],
+                result.fragment_1_energy,
+                result.fragment_2_energy,
+                result.Pauli,
+                result.dispersion,
+                result.elstat,
+                result.orbital,
+                result.interaction,
+            ])
 
-
-    table = pd.DataFrame(info, columns = [
-        "FRAME", 
-        "DISTANCE",
-        "STRAIN_FRAGMENT_1", 
-        "STRAIN_FRAGMENT_2", 
-        "PAULI", 
-        "DISP", 
-        "ELSTAT", 
-        "ORBITAL", 
-        "INTERACTION",
-        ])
+        table = pd.DataFrame(info, columns = [
+            "FRAME", 
+            "DISTANCE",
+            "STRAIN_FRAGMENT_1", 
+            "STRAIN_FRAGMENT_2", 
+            "PAULI", 
+            "DISP", 
+            "ELSTAT", 
+            "ORBITAL", 
+            "INTERACTION",
+            ])
 
     pd.set_option('display.max_colwidth', None)
     pd.set_option('display.max_columns', None)
@@ -440,7 +486,12 @@ if configuration.only_regenerate_results is False:
     # Run the scripts we constructed in ams
     run_bash_scripts(bash_scripts, calculation_folder)
 
-results = scrape_results(frame_folders)
+results = None
+
+if configuration.dumb_scrape:
+    results = dumb_scrape_results(frame_folders)
+else:
+    results = scrape_results(frame_folders)
 
 # Print the results to something so a human can view it (jupy? print? excel?) (all of them.)
 print_results(results, configuration, xyz_list, calculation_folder)
