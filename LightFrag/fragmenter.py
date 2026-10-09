@@ -23,6 +23,9 @@ graph_template_name = "template.ipynb"
 graph_template_name_destination = "graphs.ipynb"
 raw_results_name_destination = "results.csv"
 
+slurm_submit_script = "sbatch [path]"
+squeue_submit_script = "sqbatch [path] [partition] [name] [cwd]"
+
 our_folder = Path(os.path.dirname(os.path.realpath(__file__)))
 
 # XYZ object with lattices for periodic structures
@@ -93,8 +96,11 @@ class Configuration(object):
     only_regenerate_results = False
     # Only grab the formation energies from fragment_full
     dumb_scrape = False
+    # Submit a seperate slurm job for every single frame 
+    # The last-to-finish job will perform the analysis
+    parallel_slurm_execution = False
 
-    def __init__(self, IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape):
+    def __init__(self, IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape, parallel_slurm_execution):
         self.IRC_path = IRC_path
         self.fragment_mapping = fragment_mapping
         self.strain_fragment_1 = float(strain_fragment_1) if strain_fragment_1 is not None else 0.0
@@ -105,6 +111,7 @@ class Configuration(object):
         self.bond_length = float(bond_length)
         self.only_regenerate_results = only_regenerate_results if only_regenerate_results is not None else False
         self.dumb_scrape = dumb_scrape if dumb_scrape is not None else False
+        self.parallel_slurm_execution = parallel_slurm_execution if parallel_slurm_execution is not None else False
 
 # Read the the configuration header from the input file and put it in an object for easy access
 def read_configuration(data, calculation_folder):
@@ -126,11 +133,14 @@ def read_configuration(data, calculation_folder):
     dumb_scrape_value = read_parameter(config_list, "dumb_scrape", 1)
     dumb_scrape = True if dumb_scrape_value and dumb_scrape_value.lower() == "true" else False
 
+    parallel_slurm_execution_value = read_parameter(config_list, "parallel_slurm_execution", 1)
+    parallel_slurm_execution = True if parallel_slurm_execution_value and parallel_slurm_execution_value.lower() == "true" else False
+
     bond_length_atom_1, bond_length_atom_2, bond_length = read_parameter(config_list, "bond_length", 3)
 
     fragment_mapping = FragmentMapping(fragment_mapping_1, fragment_mapping_2)
 
-    return Configuration(calculation_folder + "/" + IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape)
+    return Configuration(calculation_folder + "/" + IRC_path, fragment_mapping, strain_fragment_1, strain_fragment_2, bond_length_atom_1, bond_length_atom_2, bond_length, only_regenerate_results, dumb_scrape, parallel_slurm_execution)
 
 # Read a parameter from the config
 def read_parameter(config_list, parameter_name, parameter_count) -> str|None:
@@ -189,12 +199,35 @@ def get_xyz_list(IRC_path):
     return xyz_list
 
 # Get the ams script part of the input file (which we get from the <<eor> ... eor in bash)
-def scrape_template_script(data: str):
-    # This is always the same and at the top I don't care to scrape it manually
-    bin_bash = "#!/bin/bash\n"
+def scrape_template_script(data: str, parallel_slurm_execution: bool):
+    header = ""
+    ender = ""
+
+    # If we're going to run in parallel, we need to scrape the header from the bash script that submitted this job because it contains the slurm config and environment variables
+    if parallel_slurm_execution:
+        # Just ask slurm who called us
+        bash_script_path = os.environ.get('SLURM_SUBMIT_DIR') + '/' + os.environ.get('SLURM_JOB_NAME')
+
+        # They can generate as name + "_" if using the superior smartqueue slurm handler
+        if bash_script_path[-1] == "_":
+            bash_script_path = bash_script_path[:-1]
+
+        if bash_script_path and os.path.exists(bash_script_path):
+            with open(bash_script_path, 'r', encoding='utf-8') as file:
+                header = file.read().split("# END OF DEFINITIONS")[0]
+        else:
+            print("Error: Could not find the bash script that submitted this job.")
+            return None
+        
+        ender = f"{sys.executable} {__file__} {calculation_folder} FRAME_DIR DUMB_SCRAPE\n"
+
+    else:
+        # We don't care about the header since this script will just inherit the slurm config and environment variables from the job that called it (which is us)
+        header = "#!/bin/bash\n"
+
     splitter = "End\n"
     splice = data.split(splitter, maxsplit = 1)[1]
-    return bin_bash + splice
+    return header + splice + ender
 
 # Generate the fragments atoms from the mapping
 def generate_atoms_from_mapping(fragment_mapping: list[int]|None, xyz: LatticeXyz):
@@ -205,11 +238,13 @@ def generate_atoms_from_mapping(fragment_mapping: list[int]|None, xyz: LatticeXy
     # the whole thing
     if fragment_mapping == None:
         fragment_mapping = range(1, len(xyz.atoms) + 1)
+    try:
+        for num in fragment_mapping:
+                num -= 1 # The mapping is 1 indexed, but our list is 0 indexed
+                mapped_atoms_string += f"{xyz.atoms[num][0]} {round(xyz.atoms[num][1], decimals)} {round(xyz.atoms[num][2], decimals)} {round(xyz.atoms[num][3], decimals)}\n"
+    except IndexError:
+        sys.exit("Error: Index out of bounds while generating atoms from mapping.")
 
-    for num in fragment_mapping:
-        num -= 1 # The mapping is 1 indexed, but our list is 0 indexed
-        mapped_atoms_string += f"{xyz.atoms[num][0]} {round(xyz.atoms[num][1], decimals)} {round(xyz.atoms[num][2], decimals)} {round(xyz.atoms[num][3], decimals)}\n"
-    
     return mapped_atoms_string.rstrip()
 
 # Generate the atom mapping (naming is confusing, fuck)
@@ -231,7 +266,7 @@ def generate_atom_mappings(fragment_mapping: FragmentMapping, xyz: LatticeXyz):
 def build_bash_scripts(data, configuration: Configuration, xyz_list: list[LatticeXyz]):
     bash_scripts = list()
 
-    template_script: str = scrape_template_script(data)
+    template_script: str = scrape_template_script(data, configuration.parallel_slurm_execution)
 
     for i in range(len(xyz_list)):
         bash_script = template_script
@@ -267,6 +302,8 @@ def build_bash_scripts(data, configuration: Configuration, xyz_list: list[Lattic
         bash_script = bash_script.replace("FRAGMENT_1_ATOM_MAPPING", atom_mapping_1)
         bash_script = bash_script.replace("FRAGMENT_2_ATOM_MAPPING", atom_mapping_2)
 
+        bash_script = bash_script.replace("DUMB_SCRAPE", "true" if configuration.dumb_scrape else "false")
+
         # This is a bit sketchy, but 'eor' delimits what to send to .py, but is also
         # the easiest way to controle ams job input, so we use a fake eor when writing the bash
         # file (eoj), and replace that later when we actually want to run ams jobs
@@ -291,7 +328,7 @@ def generate_folder_destinations(bash_scripts: list[str], calculation_folder):
 # Run all the bash scripts we made in .ams (and be so fucking careful you only use this when you're slurming, 
 # or you absolutely murder a login/interactive node)
 # i mean it should break and this never happened to me, BUT BE WARNED
-def run_bash_scripts(bash_scripts: list[str], calculation_folder):
+def run_bash_scripts(bash_scripts: list[str], calculation_folder, parallel_slurm_execution: bool):
     for i in range(len(bash_scripts)):
         script_folder = f"{calculation_folder}/scripts"
         frame_name = f"frame_{i}"
@@ -302,11 +339,29 @@ def run_bash_scripts(bash_scripts: list[str], calculation_folder):
             file.write(bash_scripts[i].replace("FRAME_DIR", frame_name))
 
         print(f"Running fragment_{i}.sh")
-        
-        # Make sure to comment out if you're testing on local
-        # It's probably fine because the .ams installation is hard to access by accident without slurm
-        # But it still makes me reeeeallly nervous
-        subprocess.run(["bash", script_path])
+
+        # Submit every frame parallel as a seperate job, yippie-ka-yay
+        if parallel_slurm_execution:
+            run_script = ""
+            # If we're running from smartqueue, also run our children from there and with the same node partition
+            smartqueue_partition = os.environ.get("SMARTQUEUE_PARTITION")
+            if smartqueue_partition is not None:
+                run_script = squeue_submit_script
+                run_script = run_script.replace("[partition]", smartqueue_partition)
+                run_script = run_script.replace("[name]", os.environ.get("SLURM_JOB_NAME") + "_" + frame_name)
+            else:
+                run_script = slurm_submit_script
+
+            run_script = run_script.replace("[path]", script_path)
+            run_script = run_script.replace("[cwd]", calculation_folder)
+
+            subprocess.run(["bash", "-ic", run_script], cwd=calculation_folder)
+            # print(run_script)
+
+        # Run all frames in sequence from the current slurm job
+        else:
+            subprocess.run(["bash", script_path])
+            # print("bash", script_path)
 
 def scrape_results(frame_folders: list[str]) -> list[Results]:
     results = list()
@@ -375,10 +430,10 @@ def dumb_scrape_results(frame_folders: list[str]) -> list[float]:
 
     return dumb_results
 
-def print_results(results: list[Results]|list[float], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str):
+def get_distances(frame_folders:list, configuration:Configuration, xyz_list:list[LatticeXyz]):
     distances = list()
-    for result in results:
-        index = results.index(result)
+    for frame_folder in frame_folders:
+        index = frame_folders.index(frame_folder)
         xyz_lattice = xyz_list[index]
 
         # these are lists of ['C', 0.11, 2.22, 1.11]
@@ -387,8 +442,7 @@ def print_results(results: list[Results]|list[float], configuration:Configuratio
         # sqrt((x2 - x1)^2 + (y2 - y1)^2 ...) - TS bond length
         distances.append(round(math.sqrt((atom_2[1] - atom_1[1])**2 + (atom_2[2] - atom_1[2])**2 + (atom_2[3] - atom_1[3])**2) - configuration.bond_length, 4))
 
-    write_to_notebook(results, configuration, xyz_list, destination, distances)
-    write_to_output(results, configuration, xyz_list, destination, distances)
+    return distances
 
 def write_to_notebook(results: list[Results], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str, distances):
     template = ""
@@ -414,13 +468,36 @@ def write_to_notebook(results: list[Results], configuration:Configuration, xyz_l
         jupyter_notebook.write(template)
         print("Written results to", graph_template_name_destination)
 
-def write_to_output(results: list[Results], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str, distances):
+def pregenerate_csv(destination, distances):
     info = list()
 
-    if(configuration.dumb_scrape):
+    i = 0
+    for distance in distances:
+        info.append([
+            i,
+            distance,
+        ])
+        i += 1
+
+    table = pd.DataFrame(info, columns = [
+        "FRAME", 
+        "DISTANCE",
+        ])
+
+    pd.set_option('display.max_colwidth', None)
+    pd.set_option('display.max_columns', None)
+
+    table.to_csv(f"{destination}/{raw_results_name_destination}")
+    print("Written to", raw_results_name_destination)
+
+# index overwrite is completely insane, need to change this
+def tablerize_data(results: list[Results], dumb_scrape, distances, index_overwrite:int = None):
+    info = list()
+
+    if(dumb_scrape):
         for result in results:
             info.append([
-                results.index(result),
+                index_overwrite if index_overwrite is not None else results.index(result),
                 distances[results.index(result)],
                 result.bond_energy,
             ])
@@ -432,7 +509,7 @@ def write_to_output(results: list[Results], configuration:Configuration, xyz_lis
     else:
         for result in results:
             info.append([
-                results.index(result),
+                index_overwrite if index_overwrite is not None else results.index(result),
                 distances[results.index(result)],
                 result.fragment_1_energy,
                 result.fragment_2_energy,
@@ -455,6 +532,11 @@ def write_to_output(results: list[Results], configuration:Configuration, xyz_lis
             "INTERACTION",
             ])
 
+    return table
+
+def write_to_output(results: list[Results], configuration:Configuration, xyz_list:list[LatticeXyz], destination:str, distances):
+    table = tablerize_data(results, configuration.dumb_scrape, distances)
+
     pd.set_option('display.max_colwidth', None)
     pd.set_option('display.max_columns', None)
 
@@ -463,13 +545,43 @@ def write_to_output(results: list[Results], configuration:Configuration, xyz_lis
 
     print(table)
 
+def finish_parallel_run(frame:int, master_folder:str, parallel_folder:str, dumb_scrape:bool):
+    csv_data = pd.read_csv(master_folder + "/" + raw_results_name_destination, index_col="FRAME")
+
+    if dumb_scrape:
+        results = dumb_scrape_results([parallel_folder])
+    else:
+        results = scrape_results([parallel_folder])
+    
+    new_data = tablerize_data(results, dumb_scrape, [0], frame)
+
+    new_data.set_index("FRAME", inplace=True)
+
+    csv_data = csv_data.combine_first(new_data)
+    # csv_data = csv_data.join(new_data.drop(columns=["DISTANCE"]), how="left", )
+
+    csv_data.to_csv(f"{master_folder}/{raw_results_name_destination}")
+
 ### The main code execution part
 
 # Grab all the data from the <<eor> ... eor in the input file
 data = sys.stdin.read()
 
 # Get the calculation/slurm submit folder (the one where the input file is in, which slurm gives to our input file)
+# maybe just ask from slurm? if we do we can't run it locally anymore to only scrape results
 calculation_folder = sys.argv[1]
+
+# If we're a parallel job finishing, which frame to target?
+if len(sys.argv) > 2:
+    master_folder = calculation_folder
+    parallel_frame = sys.argv[2]
+
+    parallel_frame = int(parallel_frame.replace("frame_", ""))
+    dumb_scrape = sys.argv[3] == "true"
+    # jobs are called from master folder, so "fake" the frame folder
+    calculation_folder = calculation_folder + "/" + sys.argv[2]
+    finish_parallel_run(parallel_frame, master_folder, calculation_folder, dumb_scrape)
+    quit()
 
 # Read the LightFrag configuration header so we can define how to behave
 configuration: Configuration = read_configuration(data, calculation_folder)
@@ -484,14 +596,22 @@ frame_folders = generate_folder_destinations(bash_scripts, calculation_folder)
 
 if configuration.only_regenerate_results is False:
     # Run the scripts we constructed in ams
-    run_bash_scripts(bash_scripts, calculation_folder)
+    run_bash_scripts(bash_scripts, calculation_folder, configuration.parallel_slurm_execution)
 
-results = None
+distances = get_distances(frame_folders, configuration, xyz_list)
+print("Distances", distances)
 
-if configuration.dumb_scrape:
-    results = dumb_scrape_results(frame_folders)
+if configuration.parallel_slurm_execution:
+    pregenerate_csv(calculation_folder, distances)
+    
 else:
-    results = scrape_results(frame_folders)
+    results = None
 
-# Print the results to something so a human can view it (jupy? print? excel?) (all of them.)
-print_results(results, configuration, xyz_list, calculation_folder)
+    if configuration.dumb_scrape:
+        results = dumb_scrape_results(frame_folders)
+    else:
+        results = scrape_results(frame_folders)
+
+    # Print the results to something so a human can view it (jupy? print? excel?) (all of them.)
+
+    write_to_output(results, configuration, xyz_list, calculation_folder, distances)

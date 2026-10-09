@@ -1,0 +1,73 @@
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=64
+#SBATCH --partition=tc
+
+echo "== Starting run at $(date)"
+echo "== Job ID: ${SLURM_JOBID}"
+echo "== Node list: ${SLURM_NODELIST}"
+echo "== Submit dir. : ${SLURM_SUBMIT_DIR}"
+echo "== Scratch dir. : ${TMPDIR}"
+
+module load 2022
+module load ams/2023.101
+
+# END OF DEFINITIONS - DO NOT DELETE THIS LINE
+
+LIGHTFRAG_DIRECTORY=~/LightFrag
+
+# Slurmless testing parameters
+# SLURM_JOB_NAME='jobtest'
+# SLURM_SUBMIT_DIR=~/BandFrags
+# AMSBIN="placeholder"
+
+FRAGMENT_1_NAME="fragment_1"
+FRAGMENT_2_NAME="fragment_2"
+FRAGMENT_FULL_NAME="fragment_full"
+
+$LIGHTFRAG_DIRECTORY/venv/bin/python3.11 $LIGHTFRAG_DIRECTORY/fragmenter.py $SLURM_SUBMIT_DIR <<eor>$SLURM_SUBMIT_DIR/$SLURM_JOB_NAME.out
+
+LightFrag
+    IRC_path short_test.ams.amv
+
+    bond_length 2 3 1.564
+
+    dumb_scrape true
+    parallel_slurm_execution true
+End
+
+AMS_JOBNAME=FRAME_DIR_$FRAGMENT_FULL_NAME $AMSBIN/ams <<eor>$SLURM_SUBMIT_DIR/FRAME_DIR/$FRAGMENT_FULL_NAME.out
+
+Task SinglePoint
+
+System
+    Atoms
+FRAGMENT_FULL_XYZ
+    End
+End
+
+Engine ADF
+
+    Basis
+        Type TZP
+        Core None
+    End
+
+    NumericalQuality Good
+    Unrestricted No
+
+    XC
+        GGA PBE
+        DISPERSION GRIMME3 BJDAMP
+    End
+
+EndEngine
+eoj
+
+cp FRAME_DIR_$FRAGMENT_FULL_NAME.results/ams.rkf $SLURM_SUBMIT_DIR/FRAME_DIR/$FRAGMENT_FULL_NAME.ams.rkf
+cp FRAME_DIR_$FRAGMENT_FULL_NAME.results/adf.rkf $SLURM_SUBMIT_DIR/FRAME_DIR/$FRAGMENT_FULL_NAME.adf.rkf
+cp FRAME_DIR_$FRAGMENT_FULL_NAME.results/ams.log $SLURM_SUBMIT_DIR/FRAME_DIR/$FRAGMENT_FULL_NAME.log
+
+rm -Rf FRAME_DIR_$FRAGMENT_FULL_NAME.results
+
+eor
