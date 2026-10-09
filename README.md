@@ -1,3 +1,6 @@
+# WIP!!!!
+Basically only tested on BAND systems. Take everything you read with a grain of salt
+
 # Purpose
 
 Perform lightweight fragment analysis on [Amsterdam Modeling Suite](https://www.scm.com/amsterdam-modeling-suite/) xyz movies, independent of the engine (adf, band, etc...).
