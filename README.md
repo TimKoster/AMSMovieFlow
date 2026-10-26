@@ -2,6 +2,9 @@
 Basically only tested on BAND systems. Take everything you read with a grain of salt
 
 # Purpose
+Automatically run analysis on [Amsterdam Modeling Suite](https://www.scm.com/amsterdam-modeling-suite/) xyz movies using formatted input files and [SLURM](https://github.com/schedmd/slurm). Any engine is supported, but simple energy data scraping has only been developed for ADF and BAND engines, and EDA data scraping only for the BAND engine. Parallel SLURM runners are explicitly supported for fast analysis. 
+
+OLD
 
 Perform lightweight fragment analysis on [Amsterdam Modeling Suite](https://www.scm.com/amsterdam-modeling-suite/) xyz movies, independent of the engine (adf, band, etc...).
 This script was developed specifically to work alongside with slurm on a hpc cluster, but can also be run locally. 
