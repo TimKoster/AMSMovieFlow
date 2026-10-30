@@ -217,6 +217,7 @@ def scrape_template_script(data: str, parallel_slurm_execution: bool):
                 header = file.read().split("# END OF DEFINITIONS")[0]
         else:
             print("Error: Could not find the bash script that submitted this job.")
+            print("We looked for", bash_script_path)
             return None
         
         ender = f"{sys.executable} {__file__} {calculation_folder} FRAME_DIR DUMB_SCRAPE\n"
@@ -408,8 +409,16 @@ def scrape_results(frame_folders: list[str]) -> list[Results]:
             result.dispersion = energies["E_disp"]
             result.orbital = energies["E_orb"]
             result.interaction = energies["E_int"]
-            result.fragment_1_energy = round(fragment_energies[0] - configuration.strain_fragment_1, 4)
-            result.fragment_2_energy = round(fragment_energies[1] - configuration.strain_fragment_2, 4)
+
+            # result.fragment_1_energy = round(fragment_energies[0] - configuration.strain_fragment_1, 4)
+            # result.fragment_2_energy = round(fragment_energies[1] - configuration.strain_fragment_2, 4)
+
+            # The parallel running mode inherently does not know what the config was. Maybe stop passing more arguments and just write it as a comment in the input file
+            # for later reading?
+            print("BUG: The energies from the strain are not subtracted.")
+
+            result.fragment_1_energy = round(fragment_energies[0], 4)
+            result.fragment_2_energy = round(fragment_energies[1], 4)
 
             results.append(result)
 
